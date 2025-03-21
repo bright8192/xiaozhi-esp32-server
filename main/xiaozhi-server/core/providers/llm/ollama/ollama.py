@@ -1,6 +1,6 @@
 from config.logger import setup_logging
-from openai import OpenAI
 import json
+import requests
 from core.providers.llm.base import LLMProviderBase
 
 TAG = __name__
@@ -11,39 +11,58 @@ class LLMProvider(LLMProviderBase):
     def __init__(self, config):
         self.model_name = config.get("model_name")
         self.base_url = config.get("base_url", "http://localhost:11434")
-        # Initialize OpenAI client with Ollama base URL
-        # 如果没有v1，增加v1
-        if not self.base_url.endswith("/v1"):
-            self.base_url = f"{self.base_url}/v1"
+        # Remove trailing slash if present
+        self.base_url = self.base_url.rstrip('/')
+        logger.bind(tag=TAG).info(f"Initializing Ollama with base_url: {self.base_url}")
 
-        self.client = OpenAI(
-            base_url=self.base_url,
-            api_key="ollama"  # Ollama doesn't need an API key but OpenAI client requires one
-        )
+    def _convert_messages_to_prompt(self, messages):
+        """Convert OpenAI message format to Ollama prompt format"""
+        prompt = ""
+        for msg in messages:
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+            if role == 'system':
+                prompt += f"System: {content}\n"
+            elif role == 'user':
+                prompt += f"Human: {content}\n"
+            elif role == 'assistant':
+                prompt += f"Assistant: {content}\n"
+        return prompt.strip()
 
     def response(self, session_id, dialogue):
         try:
-            responses = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=dialogue,
+            prompt = self._convert_messages_to_prompt(dialogue)
+            logger.bind(tag=TAG).debug(f"Sending request to Ollama. Model: {self.model_name}, Prompt: {prompt}")
+
+            response = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "stream": True
+                },
                 stream=True
             )
-            is_active=True
-            for chunk in responses:
-                try:
-                    delta = chunk.choices[0].delta if getattr(chunk, 'choices', None) else None
-                    content = delta.content if hasattr(delta, 'content') else ''
-                    if content:
-                        if '<think>' in content:
-                            is_active = False
-                            content = content.split('<think>')[0]
-                        if '</think>' in content:
-                            is_active = True
-                            content = content.split('</think>')[-1]
-                        if is_active:
-                            yield content
-                except Exception as e:
-                    logger.bind(tag=TAG).error(f"Error processing chunk: {e}")
+
+            response.raise_for_status()
+            is_active = True
+
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        chunk = json.loads(line)
+                        content = chunk.get('response', '')
+                        if content:
+                            if '<think>' in content:
+                                is_active = False
+                                content = content.split('<think>')[0]
+                            if '</think>' in content:
+                                is_active = True
+                                content = content.split('</think>')[-1]
+                            if is_active:
+                                yield content
+                    except Exception as e:
+                        logger.bind(tag=TAG).error(f"Error processing chunk: {e}")
 
         except Exception as e:
             logger.bind(tag=TAG).error(f"Error in Ollama response generation: {e}")
@@ -51,15 +70,35 @@ class LLMProvider(LLMProviderBase):
 
     def response_with_functions(self, session_id, dialogue, functions=None):
         try:
-            stream = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=dialogue,
-                stream=True,
-                tools=functions,
+            prompt = self._convert_messages_to_prompt(dialogue)
+            logger.bind(tag=TAG).debug(
+                f"Sending function call request to Ollama. Model: {self.model_name}, Prompt: {prompt}")
+
+            response = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "stream": True,
+                    "options": {
+                        "functions": functions
+                    }
+                },
+                stream=True
             )
 
-            for chunk in stream:
-                yield chunk.choices[0].delta.content, chunk.choices[0].delta.tool_calls
+            response.raise_for_status()
+
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        chunk = json.loads(line)
+                        content = chunk.get('response', '')
+                        # Since Ollama doesn't natively support function calls,
+                        # we'll yield the content without tool calls
+                        yield content, None
+                    except Exception as e:
+                        logger.bind(tag=TAG).error(f"Error processing chunk: {e}")
 
         except Exception as e:
             logger.bind(tag=TAG).error(f"Error in Ollama function call: {e}")
